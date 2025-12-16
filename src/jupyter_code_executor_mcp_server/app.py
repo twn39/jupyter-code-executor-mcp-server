@@ -75,22 +75,47 @@ async def _shutdown_all_sessions():
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+
+# 新增全局变量来跟踪任务和连接数
+_global_cleanup_task: Optional[asyncio.Task] = None
+_active_connections: int = 0
+
 @asynccontextmanager
 async def server_lifespan(server: FastMCP):
+    global _global_cleanup_task, _active_connections
+
+    # 1. 连接计数 +1
+    _active_connections += 1
     timeout = int(server.settings.debug) if False else 60
-    cleanup_task = asyncio.create_task(_cleanup_loop(timeout))
+
+    # 2. 仅在第一个连接建立且任务未运行时，启动全局清理任务
+    if _global_cleanup_task is None or _global_cleanup_task.done():
+        logger.info("启动全局后台清理任务...")
+        _global_cleanup_task = asyncio.create_task(_cleanup_loop(timeout))
+    else:
+        logger.info(f"复用现有清理任务 (当前活跃连接数: {_active_connections})")
 
     try:
-        yield  # <--- 服务器在这里运行
+        yield
     finally:
-        cleanup_task.cancel()
-        try:
-            await cleanup_task
-        except (asyncio.CancelledError, asyncio.exceptions.CancelledError):
-            pass
+        # 3. 连接计数 -1
+        _active_connections -= 1
+        logger.info(f"连接断开 (剩余活跃连接数: {_active_connections})")
 
-        await _shutdown_all_sessions()
-        logger.info("资源清理完毕，服务退出。")
+        # 4. 仅当没有活跃连接时，才执行清理和关闭操作
+        if _active_connections <= 0:
+            logger.info("无活跃连接，停止后台清理任务并关闭所有会话...")
+
+            if _global_cleanup_task:
+                _global_cleanup_task.cancel()
+                try:
+                    await _global_cleanup_task
+                except asyncio.CancelledError:
+                    pass
+                _global_cleanup_task = None
+
+            await _shutdown_all_sessions()
+
 
 mcp = FastMCP(
     "Jupyter Code Executor MCP Server",
