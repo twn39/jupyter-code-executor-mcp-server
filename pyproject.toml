@@ -1,6 +1,6 @@
 [project]
 name = "jupyter-code-executor-mcp-server"
-version = "0.1.0"
+version = "0.2.0"
 description = "Jupyter code executor mcp server"
 readme = "README.md"
 keywords = ["ai", "mcp", "jupyter-mcp", "code-executor", "mcp-server", "jupyter-code-executor-mcp-server"]
