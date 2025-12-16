@@ -178,11 +178,6 @@ Contributions are welcome! Please feel free to submit a Pull Request. For major 
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 👤 Author
-
-**Curry Tang**
-- Email: twn39@163.com
-- GitHub: [@twn39](https://github.com/twn39)
 
 ## 🙏 Acknowledgments
 
