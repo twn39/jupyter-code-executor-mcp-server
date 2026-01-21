@@ -1,13 +1,10 @@
 import os
 import click
-import time
-import asyncio
 import signal
 import logging
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Literal, cast
-from dataclasses import dataclass
+from typing import Optional, Literal, cast
 from mcp.server import FastMCP
 from autogen_core import CancellationToken
 from contextlib import asynccontextmanager
@@ -15,106 +12,49 @@ from autogen_core.code_executor import CodeBlock
 from jupyter_client.kernelspec import KernelSpecManager
 from autogen_ext.code_executors.jupyter import JupyterCodeExecutor
 from jupyter_code_executor_mcp_server.prompts import data_analyst_prompt
+from jupyter_code_executor_mcp_server.session import SessionManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger("JupyterMCP")
 
-
-@dataclass
-class SessionInfo:
-    executor: JupyterCodeExecutor
-    last_accessed: float
-
-sessions: Dict[str, SessionInfo] = {}
-
-async def _cleanup_loop(timeout: int):
-    logger.info("后台清理任务已启动...")
-    try:
-        while True:
-            await asyncio.sleep(60)
-            now = time.time()
-            expired_ids = [
-                sid for sid, info in sessions.items()
-                if now - info.last_accessed > timeout
-            ]
-
-            for sid in expired_ids:
-                logger.info(f"清理过期会话: {sid}")
-                await _close_session(sid)
-
-    except asyncio.CancelledError:
-        logger.info("后台清理任务收到停止信号")
-        # 这里不需要做额外处理，直接退出循环即可，清理工作交给 lifespan 的 finally
-
-async def _close_session(session_id: str):
-    """安全关闭单个会话"""
-    if session_id in sessions:
-        info = sessions.pop(session_id)
-        logger.info(f"正在关闭会话: {session_id}")
-        try:
-            # 关键修复：使用 shield 保护关闭过程，防止在关闭中途被再次取消导致状态不一致
-            # Use stop() which includes checks, and catch AssertionError common in dry cleanups
-            original_sigint = signal.getsignal(signal.SIGINT)
-            # JupyterCodeExecutor.stop() is safer than __aexit__
-            await asyncio.shield(info.executor.stop())
-            signal.signal(signal.SIGINT, original_sigint)
-        except (AssertionError, Exception, asyncio.exceptions.CancelledError) as e:
-            # Capture AssertionError from nbclient double-cleanup
-            logger.warning(f"关闭会话 {session_id} 时发生错误 (已忽略): {e}")
-
-async def _shutdown_all_sessions():
-    """关闭所有活跃会话"""
-    if not sessions:
-        return
-    logger.info(f"正在关闭所有活跃会话 ({len(sessions)} 个)...")
-    # 创建副本进行遍历
-    active_sessions = list(sessions.keys())
-    # 并发关闭可以加快退出速度
-    tasks = [asyncio.create_task(_close_session(sid)) for sid in active_sessions]
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-
-
-# 新增全局变量来跟踪任务和连接数
-_global_cleanup_task: Optional[asyncio.Task] = None
+# 全局 SessionManager 实例和连接计数
+_session_manager: Optional[SessionManager] = None
 _active_connections: int = 0
+
+
+def get_session_manager() -> SessionManager:
+    """获取全局 SessionManager 实例。"""
+    global _session_manager
+    if _session_manager is None:
+        timeout = int(os.getenv("SESSION_TIMEOUT") or "600")
+        _session_manager = SessionManager(timeout=timeout)
+    return _session_manager
+
 
 @asynccontextmanager
 async def server_lifespan(server: FastMCP):
-    global _global_cleanup_task, _active_connections
+    global _active_connections
 
-    # 1. 连接计数 +1
+    session_manager = get_session_manager()
     _active_connections += 1
-    timeout = int(server.settings.debug) if False else 60
 
-    # 2. 仅在第一个连接建立且任务未运行时，启动全局清理任务
-    if _global_cleanup_task is None or _global_cleanup_task.done():
-        logger.info("启动全局后台清理任务...")
-        _global_cleanup_task = asyncio.create_task(_cleanup_loop(timeout))
+    # 仅在第一个连接建立时启动清理任务
+    if _active_connections == 1:
+        await session_manager.start_cleanup_loop()
     else:
         logger.info(f"复用现有清理任务 (当前活跃连接数: {_active_connections})")
 
     try:
         yield
     finally:
-        # 3. 连接计数 -1
         _active_connections -= 1
         logger.info(f"连接断开 (剩余活跃连接数: {_active_connections})")
 
-        # 4. 仅当没有活跃连接时，才执行清理和关闭操作
+        # 仅当没有活跃连接时，才执行清理和关闭操作
         if _active_connections <= 0:
             logger.info("无活跃连接，停止后台清理任务并关闭所有会话...")
-
-            if _global_cleanup_task:
-                _global_cleanup_task.cancel()
-                try:
-                    await _global_cleanup_task
-                except asyncio.CancelledError:
-                    pass
-                _global_cleanup_task = None
-
-            await _shutdown_all_sessions()
+            await session_manager.stop_cleanup_loop()
+            await session_manager.close_all()
 
 
 mcp = FastMCP(
@@ -176,24 +116,19 @@ async def execute_code(code: str, kernel_name: str, session_id: Optional[str] = 
     """
     try:
         output_dir = Path(os.getenv('OUTPUT_DIR') or "~/output").expanduser()
+        session_manager = get_session_manager()
 
         if session_id is not None:
-            if session_id not in sessions:
-                executor = JupyterCodeExecutor(kernel_name=kernel_name, output_dir=output_dir, timeout=600)
-                # Capture signal before enter
-                original_sigint = signal.getsignal(signal.SIGINT)
-                await executor.start()
-                # Restore signal immediately after enter
-                signal.signal(signal.SIGINT, original_sigint)
-                sessions[session_id] = SessionInfo(executor, time.time())
-            info = sessions[session_id]
-            info.last_accessed = time.time() # 更新时间
-        
-            # Verify if kernel aligns (optional check, strictly we might assume session_id binds to a kernel type)
-            # but for now we trust the session maps to the right executor or we could check executor.kernel_name if accessible
+            # 使用 SessionManager 获取或创建会话
+            executor = await session_manager.get_or_create(
+                session_id=session_id,
+                kernel_name=kernel_name,
+                output_dir=output_dir
+            )
+            
             cancel_token = CancellationToken()
             code_blocks = [CodeBlock(code=code, language=kernel_name)]
-            result = await info.executor.execute_code_blocks(code_blocks, cancel_token)
+            result = await executor.execute_code_blocks(code_blocks, cancel_token)
             
             output_msg = f"Kernel: {kernel_name} (Session: {session_id})\n"
             output_msg += f"Exit Code: {result.exit_code}\n"
@@ -202,13 +137,11 @@ async def execute_code(code: str, kernel_name: str, session_id: Optional[str] = 
 
         else:
             # Stateless execution (maintain backward compatibility)
-            # 注意：JupyterCodeExecutor 每次都会启动新会话，保持无状态
-            # 手动管理上下文以确保信号恢复
             executor = JupyterCodeExecutor(kernel_name=kernel_name, timeout=600, output_dir=output_dir)
             original_sigint = signal.getsignal(signal.SIGINT)
             try:
                 await executor.start()
-                signal.signal(signal.SIGINT, original_sigint) # Restore after start
+                signal.signal(signal.SIGINT, original_sigint)
 
                 cancel_token = CancellationToken()
                 code_blocks = [CodeBlock(code=code, language=kernel_name)]
@@ -217,8 +150,8 @@ async def execute_code(code: str, kernel_name: str, session_id: Optional[str] = 
                 try:
                     await executor.stop()
                 except (AssertionError, Exception):
-                    pass # Ignore cleanup errors during shutdown
-                signal.signal(signal.SIGINT, original_sigint) # Restore after exit
+                    pass
+                signal.signal(signal.SIGINT, original_sigint)
 
                 output_msg = f"Kernel: {kernel_name}\n"
                 output_msg += f"Exit Code: {result.exit_code}\n"
@@ -252,10 +185,8 @@ def get_current_time() -> str:
     Get the current time in a more human-readable format.
     """
     now = datetime.now()
-    current_time = now.strftime("%I:%M:%S %p")  # Using 12-hour format with AM/PM
-    current_date = now.strftime(
-        "%A, %B %d, %Y"
-    )  # Full weekday, month name, day, and year
+    current_time = now.strftime("%I:%M:%S %p")
+    current_date = now.strftime("%A, %B %d, %Y")
 
     return f"Current Date and Time = {current_date}, {current_time}"
 
@@ -266,9 +197,16 @@ def get_current_time() -> str:
 @click.option("--data_dir", "-d", type=str, help="user data dir, default: ~/data")
 @click.option("--output_dir", "-o", type=str, help="code output dir, default: ~/output")
 @click.option("--session-timeout", "-st", type=int, help="session timeout in seconds, default: 600")
-def serve(transport: Optional[str], port: Optional[int], data_dir: Optional[str], output_dir: Optional[str], session_timeout: Optional[int]):
+def serve(
+    transport: Optional[str],
+    port: Optional[int],
+    data_dir: Optional[str],
+    output_dir: Optional[str],
+    session_timeout: Optional[int]
+):
     os.environ["DATA_DIR"] = data_dir or "~/data"
     os.environ["OUTPUT_DIR"] = output_dir or "~/output"
+    os.environ["SESSION_TIMEOUT"] = str(session_timeout or 600)
     
     mcp.settings.port = port or 5010
     _transport = cast(Literal["stdio", "sse", "streamable-http"], transport or "streamable-http")
@@ -276,4 +214,7 @@ def serve(transport: Optional[str], port: Optional[int], data_dir: Optional[str]
 
 
 if __name__ == "__main__":
-    serve()
+    try:
+        serve()
+    except KeyboardInterrupt:
+        pass
