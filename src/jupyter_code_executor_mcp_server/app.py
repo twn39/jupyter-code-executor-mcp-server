@@ -6,7 +6,7 @@ import signal
 import logging
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict
+from typing import Optional, Dict, Literal, cast
 from dataclasses import dataclass
 from mcp.server import FastMCP
 from autogen_core import CancellationToken
@@ -162,20 +162,20 @@ def list_prompts() -> str:
 
 
 @mcp.tool()
-async def execute_code(code: str, kernel_name: str, session_id: str = None) -> str:
+async def execute_code(code: str, kernel_name: str, session_id: Optional[str] = None) -> str:
     """
     使用指定的 Jupyter Kernel 执行代码片段。
-    支持多语言（Python, R, Julia 等），具体取决于系统安装的 Kernel。
+    支持多语言(Python, R, Julia 等），具体取决于系统安装的 Kernel。
 
     Args:
         code: 需要执行的代码字符串。
         kernel_name: 目标 Kernel 的名称（例如 'python3' 或 'ir'）。
                      请务必使用 list_kernels 工具获取准确的名称。
-        session_id: (可选) 会话 ID。如果提供，将尝试复用由于该 ID 关联的 Kernel 上下文。
+        session_id: (可选) 会话 UUID。如果提供, 将尝试复用由于该 ID 关联的 Kernel 上下文。
                     这允许在同一次对话中保持变量状态。如果不提供，将创建临时的无状态执行环境。
     """
     try:
-        output_dir = Path(os.getenv('OUTPUT_DIR')).expanduser()
+        output_dir = Path(os.getenv('OUTPUT_DIR') or "~/output").expanduser()
 
         if session_id is not None:
             if session_id not in sessions:
@@ -238,7 +238,7 @@ def list_files() -> str:
     Returns:
         文件列表
     """
-    user_dir = Path(os.getenv('DATA_DIR')).expanduser()
+    user_dir = Path(os.getenv('DATA_DIR') or "~/data").expanduser()
     if not user_dir.exists():
         user_dir.mkdir(parents=True, exist_ok=True)
 
@@ -271,7 +271,7 @@ def serve(transport: Optional[str], port: Optional[int], data_dir: Optional[str]
     os.environ["OUTPUT_DIR"] = output_dir or "~/output"
     
     mcp.settings.port = port or 5010
-    _transport = transport or "streamable-http"
+    _transport = cast(Literal["stdio", "sse", "streamable-http"], transport or "streamable-http")
     mcp.run(transport=_transport)
 
 
