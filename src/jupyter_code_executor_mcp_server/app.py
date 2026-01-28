@@ -82,6 +82,8 @@ class SessionManager:
                 for session_id in expired_sessions:
                     logger.info(f"Session {session_id} expired (idle > {timeout_seconds}s). Cleaning up.")
                     await self.stop(session_id)
+                
+                logger.info(f"Active sessions: {len(self._sessions)}")
                     
             except asyncio.CancelledError:
                 break
@@ -182,8 +184,8 @@ async def execute_code(code: str, kernel_name: str, session_id: Optional[str] = 
         )
         await executor.start()
 
+    cancellation_token = CancellationToken()
     try:
-        cancellation_token = CancellationToken()
         code_block = CodeBlock(code=code, language="python") # Language is mainly for highlighting, kernel determines execution
         
         logger.info(f"Executing code block in session {session_id or 'temp'}")
@@ -242,13 +244,11 @@ def get_current_time() -> str:
 
 
 @click.command()
-@click.option("--transport", "-t", type=str, help="server transport, default: streamable-http")
 @click.option("--port", "-p", type=int, help="server listening port, default: 5010")
 @click.option("--data_dir", "-d", type=str, help="user data dir, default: ~/data")
 @click.option("--output_dir", "-o", type=str, help="code output dir, default: ~/output")
 @click.option("--session-timeout", "-st", type=int, help="session timeout in seconds, default: 600")
 def serve(
-    transport: Optional[str],
     port: Optional[int],
     data_dir: Optional[str],
     output_dir: Optional[str],
