@@ -1,3 +1,4 @@
+import inspect
 import os
 import click
 import logging
@@ -5,18 +6,18 @@ from pathlib import Path
 from datetime import datetime
 import asyncio
 from typing import Optional, Dict
-from mcp.server import FastMCP
-from jupyter_code_executor_mcp_server.prompts import data_analyst_prompt
-from autogen_core import CancellationToken
 from autogen_core.code_executor import CodeBlock
-from jupyter_code_executor_mcp_server.safe_notebook import SafeJupyterCodeExecutor
+from mcp.server import FastMCP
+from autogen_core import CancellationToken
 from jupyter_client.kernelspec import KernelSpecManager
-import inspect
+import uvicorn
+from contextlib import asynccontextmanager
+from jupyter_code_executor_mcp_server.prompts import data_analyst_prompt
+from jupyter_code_executor_mcp_server.safe_notebook import SafeJupyterCodeExecutor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger("JupyterMCP")
 
-# Global session storage
 # Global session storage
 class SessionManager:
     def __init__(self):
@@ -111,20 +112,11 @@ class SessionManager:
 
 session_manager = SessionManager()
 
-from contextlib import asynccontextmanager
-
 @asynccontextmanager
 async def server_lifespan(server):
     session_manager.start_cleanup()
     yield
     await session_manager.shutdown_all()
-    
-    # Debug: Check for hanging tasks
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    if tasks:
-        logger.info(f"Found {len(tasks)} pending tasks on shutdown:")
-        for t in tasks:
-            logger.info(f"  - {t.get_name()}: {t.get_coro()}")
 
 mcp = FastMCP(
     "Jupyter Code Executor MCP Server",
@@ -176,7 +168,6 @@ async def execute_code(code: str, kernel_name: str, session_id: Optional[str] = 
     output_dir = Path(os.getenv("OUTPUT_DIR", "~/output")).expanduser()
     
     # Determine which executor to use
-    executor = None
     is_temporary = False
 
     if session_id:
@@ -197,7 +188,6 @@ async def execute_code(code: str, kernel_name: str, session_id: Optional[str] = 
         
         logger.info(f"Executing code block in session {session_id or 'temp'}")
         result = await executor.execute_code_blocks([code_block], cancellation_token)
-        logger.info("Code execution completed")
         
         response = []
         if result.output:
@@ -208,23 +198,20 @@ async def execute_code(code: str, kernel_name: str, session_id: Optional[str] = 
                 response.append(f"- {f}")
         
         if result.exit_code != 0:
-            response.append(f"\nExecution failed with exit code {result.exit_code}")
+            # Shorten output for log if needed, but here just log exit code
+            pass 
 
         return "\n".join(response)
 
     except asyncio.CancelledError:
-        logger.info("Execution cancelled by system (CancelledError)")
         cancellation_token.cancel()
-        logger.info("Cancellation token triggered, re-raising CancelledError")
         raise
     except Exception as e:
         logger.error(f"Error during execution: {e}")
         raise
     finally:
         if is_temporary:
-            logger.info("Stopping temporary session")
             await executor.stop()
-            logger.info("Temporary session stopped")
 
 @mcp.tool()
 def list_files() -> str:
@@ -271,19 +258,11 @@ def serve(
     os.environ["OUTPUT_DIR"] = output_dir or "~/output"
     os.environ["SESSION_TIMEOUT"] = str(session_timeout or 600)
     
-    os.environ["DATA_DIR"] = data_dir or "~/data"
-    os.environ["OUTPUT_DIR"] = output_dir or "~/output"
-    os.environ["SESSION_TIMEOUT"] = str(session_timeout or 600)
-    
     port = port or 5010
     
     # We enforce streamable-http and run uvicorn manually to control shutdown timeout
     # mcp.run(transport="streamable-http") 
     
-    import uvicorn
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.responses import Response
-
     # Middleware to suppress CancelledError during shutdown to avoid noisy tracebacks
     async def suppress_cancellation_middleware(scope, receive, send):
         try:
