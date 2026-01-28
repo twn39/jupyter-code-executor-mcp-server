@@ -81,6 +81,10 @@ class SessionManager:
                 logger.error(f"Error in cleanup loop: {e}")
     
     def start_cleanup(self):
+        if self._cleanup_task and not self._cleanup_task.done():
+            logger.warning("Cleanup task is already running. Ignoring start_cleanup request.")
+            return
+            
         self._shutdown_event.clear()
         self._cleanup_task = asyncio.create_task(self.cleanup_loop())
 
