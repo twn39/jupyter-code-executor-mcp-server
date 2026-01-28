@@ -1,6 +1,7 @@
 # Jupyter Code Executor MCP Server
 
 [![Python >= 3.11](https://img.shields.io/badge/python-%3E%3D3.11-blue.svg)](https://www.python.org/downloads/)
+[![PyPI version](https://img.shields.io/pypi/v/jupyter-code-executor-mcp-server.svg)](https://pypi.org/project/jupyter-code-executor-mcp-server/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![MCP](https://img.shields.io/badge/MCP-1.23.1-green.svg)](https://pypi.org/project/mcp/)
 
@@ -68,7 +69,6 @@ uv run jupyter-code-executor-mcp-server \
 
 | Option | Short | Description | Default |
 |--------|-------|-------------|---------|
-| `--transport` | `-t` | Server transport protocol | `streamable-http` |
 | `--port` | `-p` | Server listening port | `5010` |
 | `--data_dir` | `-d` | User data directory | `~/data` |
 | `--output_dir` | `-o` | Code output directory | `~/output` |
