@@ -1,61 +1,34 @@
 import os
 import click
-import signal
 import logging
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Literal, cast
+import asyncio
+from typing import Optional, Literal, cast, Dict
 from mcp.server import FastMCP
-from autogen_core import CancellationToken
-from contextlib import asynccontextmanager
-from autogen_core.code_executor import CodeBlock
-from jupyter_client.kernelspec import KernelSpecManager
-from autogen_ext.code_executors.jupyter import JupyterCodeExecutor
 from jupyter_code_executor_mcp_server.prompts import data_analyst_prompt
-from jupyter_code_executor_mcp_server.session import SessionManager
+from autogen_core import CancellationToken
+from autogen_core.code_executor import CodeBlock
+from autogen_ext.code_executors.jupyter import JupyterCodeExecutor
+from jupyter_client.kernelspec import KernelSpecManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger("JupyterMCP")
 
-# 全局 SessionManager 实例和连接计数
-_session_manager: Optional[SessionManager] = None
-_active_connections: int = 0
+# Global session storage
+_sessions: Dict[str, JupyterCodeExecutor] = {}
 
-
-def get_session_manager() -> SessionManager:
-    """获取全局 SessionManager 实例。"""
-    global _session_manager
-    if _session_manager is None:
-        timeout = int(os.getenv("SESSION_TIMEOUT") or "600")
-        _session_manager = SessionManager(timeout=timeout)
-    return _session_manager
-
-
-@asynccontextmanager
-async def server_lifespan(server: FastMCP):
-    global _active_connections
-
-    session_manager = get_session_manager()
-    _active_connections += 1
-
-    # 仅在第一个连接建立时启动清理任务
-    if _active_connections == 1:
-        await session_manager.start_cleanup_loop()
-    else:
-        logger.info(f"复用现有清理任务 (当前活跃连接数: {_active_connections})")
-
-    try:
-        yield
-    finally:
-        _active_connections -= 1
-        logger.info(f"连接断开 (剩余活跃连接数: {_active_connections})")
-
-        # 仅当没有活跃连接时，才执行清理和关闭操作
-        if _active_connections <= 0:
-            logger.info("无活跃连接，停止后台清理任务并关闭所有会话...")
-            await session_manager.stop_cleanup_loop()
-            await session_manager.close_all()
-
+async def server_lifespan(context):
+    yield
+    # Cleanup all sessions on shutdown
+    logger.info(f"Cleaning up {len(_sessions)} active sessions...")
+    for session_id, executor in _sessions.items():
+        try:
+            await executor.stop()
+            logger.info(f"Stopped session {session_id}")
+        except Exception as e:
+            logger.error(f"Failed to stop session {session_id}: {e}")
+    _sessions.clear()
 
 mcp = FastMCP(
     "Jupyter Code Executor MCP Server",
@@ -74,25 +47,15 @@ def list_kernels() -> str:
     Returns:
         返回一个字符串列表，包含 Kernel 的内部名称（用于调用）和显示名称。
     """
-    try:
-        ksm = KernelSpecManager()
-        specs = ksm.get_all_specs()
-
-        if not specs:
-            return "No Jupyter kernels found on this system."
-
-        output = "Available Jupyter Kernels:\n"
-        output += "Format: [Kernel Name] - [Display Name]\n"
-        output += "-" * 40 + "\n"
-
-        for name, details in specs.items():
-            display_name = details.get('spec', {}).get('display_name', 'Unknown')
-            output += f"- {name}: {display_name}\n"
-
-        return output
-
-    except Exception as e:
-        return f"Error listing kernels: {str(e)}"
+    ksm = KernelSpecManager()
+    specs = ksm.get_all_specs()
+    
+    result = []
+    for name, spec in specs.items():
+        display_name = spec.get('spec', {}).get('display_name', name)
+        result.append(f"- {name}: {display_name}")
+    
+    return "\n".join(result)
 
 
 @mcp.prompt()
@@ -114,54 +77,57 @@ async def execute_code(code: str, kernel_name: str, session_id: Optional[str] = 
         session_id: (可选) 会话 UUID。如果提供, 将尝试复用由于该 ID 关联的 Kernel 上下文。
                     这允许在同一次对话中保持变量状态。如果不提供，将创建临时的无状态执行环境。
     """
-    try:
-        output_dir = Path(os.getenv('OUTPUT_DIR') or "~/output").expanduser()
-        session_manager = get_session_manager()
+    output_dir = Path(os.getenv("OUTPUT_DIR", "~/output")).expanduser()
+    
+    # Determine which executor to use
+    executor = None
+    is_temporary = False
 
-        if session_id is not None:
-            # 使用 SessionManager 获取或创建会话
-            executor = await session_manager.get_or_create(
-                session_id=session_id,
-                kernel_name=kernel_name,
-                output_dir=output_dir
-            )
-            
-            cancel_token = CancellationToken()
-            code_blocks = [CodeBlock(code=code, language=kernel_name)]
-            result = await executor.execute_code_blocks(code_blocks, cancel_token)
-            
-            output_msg = f"Kernel: {kernel_name} (Session: {session_id})\n"
-            output_msg += f"Exit Code: {result.exit_code}\n"
-            output_msg += f"Output:\n{result.output}"
-            return output_msg
-
+    if session_id:
+        if session_id in _sessions:
+            executor = _sessions[session_id]
         else:
-            # Stateless execution (maintain backward compatibility)
-            executor = JupyterCodeExecutor(kernel_name=kernel_name, timeout=600, output_dir=output_dir)
-            original_sigint = signal.getsignal(signal.SIGINT)
-            try:
-                await executor.start()
-                signal.signal(signal.SIGINT, original_sigint)
+            # Create new persistent session
+            logger.info(f"Creating new session: {session_id} with kernel {kernel_name}")
+            executor = JupyterCodeExecutor(
+                kernel_name=kernel_name,
+                output_dir=output_dir,
+                timeout=int(os.environ.get("SESSION_TIMEOUT", 600))
+            )
+            await executor.start()
+            _sessions[session_id] = executor
+    else:
+        # Create temporary executor
+        is_temporary = True
+        executor = JupyterCodeExecutor(
+            kernel_name=kernel_name,
+            output_dir=output_dir,
+            timeout=int(os.environ.get("SESSION_TIMEOUT", 600))
+        )
+        await executor.start()
 
-                cancel_token = CancellationToken()
-                code_blocks = [CodeBlock(code=code, language=kernel_name)]
-                result = await executor.execute_code_blocks(code_blocks, cancel_token)
-            finally:
-                try:
-                    await executor.stop()
-                except (AssertionError, Exception):
-                    pass
-                signal.signal(signal.SIGINT, original_sigint)
+    try:
+        cancellation_token = CancellationToken()
+        code_block = CodeBlock(code=code, language="python") # Language is mainly for highlighting, kernel determines execution
+        
+        result = await executor.execute_code_blocks([code_block], cancellation_token)
+        
+        response = []
+        if result.output:
+            response.append(f"Output:\n{result.output}")
+        if result.output_files:
+            response.append("Generated Files:")
+            for f in result.output_files:
+                response.append(f"- {f}")
+        
+        if result.exit_code != 0:
+            response.append(f"\nExecution failed with exit code {result.exit_code}")
 
-                output_msg = f"Kernel: {kernel_name}\n"
-                output_msg += f"Exit Code: {result.exit_code}\n"
-                output_msg += f"Output:\n{result.output}"
+        return "\n".join(response)
 
-                return output_msg
-
-    except Exception as e:
-        return f"Error executing code with kernel '{kernel_name}': {str(e)}"
-
+    finally:
+        if is_temporary:
+            await executor.stop()
 
 @mcp.tool()
 def list_files() -> str:
