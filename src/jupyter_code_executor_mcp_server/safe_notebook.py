@@ -1,13 +1,8 @@
-import asyncio
 import atexit
-import signal
 import typing as t
 from contextlib import asynccontextmanager
-from time import monotonic
-
 from nbclient import NotebookClient
-from nbclient.util import run_hook, ensure_async
-
+from nbclient.util import run_hook
 from autogen_ext.code_executors.jupyter import JupyterCodeExecutor
 from nbformat import NotebookNode
 from nbformat import v4 as nbformat
