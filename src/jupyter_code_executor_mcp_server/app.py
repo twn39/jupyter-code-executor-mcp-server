@@ -207,6 +207,16 @@ async def execute_code(code: str, kernel_name: str, session_id: Optional[str] = 
 
     except asyncio.CancelledError:
         cancellation_token.cancel()
+        
+        # If this is a persistent session, the kernel might still be busy running the cancelled code.
+        # We must restart it to ensure it's ready for future requests.
+        if session_id:
+             logger.warning(f"Session {session_id} execution cancelled. Restarting kernel to recover state.")
+             try:
+                 await executor.restart()
+             except Exception as restart_err:
+                 logger.error(f"Failed to restart session {session_id} after cancellation: {restart_err}")
+        
         raise
     except Exception as e:
         logger.error(f"Error during execution: {e}")
