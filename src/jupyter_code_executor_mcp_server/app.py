@@ -10,25 +10,76 @@ from jupyter_code_executor_mcp_server.prompts import data_analyst_prompt
 from autogen_core import CancellationToken
 from autogen_core.code_executor import CodeBlock
 from autogen_ext.code_executors.jupyter import JupyterCodeExecutor
+from jupyter_code_executor_mcp_server.safe_notebook import SafeJupyterCodeExecutor
+from autogen_ext.code_executors.jupyter import JupyterCodeExecutor
+from jupyter_code_executor_mcp_server.safe_notebook import SafeJupyterCodeExecutor
 from jupyter_client.kernelspec import KernelSpecManager
+import inspect
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger("JupyterMCP")
 
 # Global session storage
-_sessions: Dict[str, JupyterCodeExecutor] = {}
+class SessionManager:
+    def __init__(self):
+        self._sessions: Dict[str, SafeJupyterCodeExecutor] = {}
 
-async def server_lifespan(context):
+    async def get_or_create(self, session_id: str, kernel_name: str, output_dir: Path) -> SafeJupyterCodeExecutor:
+        if session_id in self._sessions:
+            return self._sessions[session_id]
+        
+        logger.info(f"Creating new session: {session_id} with kernel {kernel_name}")
+        executor = SafeJupyterCodeExecutor(
+            kernel_name=kernel_name,
+            output_dir=output_dir,
+            timeout=int(os.environ.get("SESSION_TIMEOUT", 600))
+        )
+        await executor.start()
+        self._sessions[session_id] = executor
+        return executor
+    
+    async def stop(self, session_id: str):
+        if session_id in self._sessions:
+            executor = self._sessions[session_id]
+            try:
+                # Shield execution to prevent cancellation of cleanup
+                # Wait for 2 seconds
+                await asyncio.wait_for(asyncio.shield(executor.stop()), timeout=2.0)
+                logger.info(f"Stopped session {session_id}")
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout while stopping session {session_id}")
+            except Exception as e:
+                logger.error(f"Error stopping session {session_id}: {e}")
+            finally:
+                # Force remove even if stop failed
+                if session_id in self._sessions:
+                    del self._sessions[session_id]
+
+    async def shutdown_all(self):
+        logger.info(f"Cleaning up {len(self._sessions)} active sessions...")
+        # Create a copy of keys to iterate safely
+        session_ids = list(self._sessions.keys())
+        # Run all stops concurrently to speed up shutdown
+        tasks = [self.stop(sid) for sid in session_ids]
+        if tasks:
+             await asyncio.gather(*tasks)
+        self._sessions.clear()
+
+session_manager = SessionManager()
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def server_lifespan(server):
     yield
-    # Cleanup all sessions on shutdown
-    logger.info(f"Cleaning up {len(_sessions)} active sessions...")
-    for session_id, executor in _sessions.items():
-        try:
-            await executor.stop()
-            logger.info(f"Stopped session {session_id}")
-        except Exception as e:
-            logger.error(f"Failed to stop session {session_id}: {e}")
-    _sessions.clear()
+    await session_manager.shutdown_all()
+    
+    # Debug: Check for hanging tasks
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    if tasks:
+        logger.info(f"Found {len(tasks)} pending tasks on shutdown:")
+        for t in tasks:
+            logger.info(f"  - {t.get_name()}: {t.get_coro()}")
 
 mcp = FastMCP(
     "Jupyter Code Executor MCP Server",
@@ -84,22 +135,11 @@ async def execute_code(code: str, kernel_name: str, session_id: Optional[str] = 
     is_temporary = False
 
     if session_id:
-        if session_id in _sessions:
-            executor = _sessions[session_id]
-        else:
-            # Create new persistent session
-            logger.info(f"Creating new session: {session_id} with kernel {kernel_name}")
-            executor = JupyterCodeExecutor(
-                kernel_name=kernel_name,
-                output_dir=output_dir,
-                timeout=int(os.environ.get("SESSION_TIMEOUT", 600))
-            )
-            await executor.start()
-            _sessions[session_id] = executor
+        executor = await session_manager.get_or_create(session_id, kernel_name, output_dir)
     else:
         # Create temporary executor
         is_temporary = True
-        executor = JupyterCodeExecutor(
+        executor = SafeJupyterCodeExecutor(
             kernel_name=kernel_name,
             output_dir=output_dir,
             timeout=int(os.environ.get("SESSION_TIMEOUT", 600))
@@ -110,7 +150,9 @@ async def execute_code(code: str, kernel_name: str, session_id: Optional[str] = 
         cancellation_token = CancellationToken()
         code_block = CodeBlock(code=code, language="python") # Language is mainly for highlighting, kernel determines execution
         
+        logger.info(f"Executing code block in session {session_id or 'temp'}")
         result = await executor.execute_code_blocks([code_block], cancellation_token)
+        logger.info("Code execution completed")
         
         response = []
         if result.output:
@@ -125,9 +167,19 @@ async def execute_code(code: str, kernel_name: str, session_id: Optional[str] = 
 
         return "\n".join(response)
 
+    except asyncio.CancelledError:
+        logger.info("Execution cancelled by system (CancelledError)")
+        cancellation_token.cancel()
+        logger.info("Cancellation token triggered, re-raising CancelledError")
+        raise
+    except Exception as e:
+        logger.error(f"Error during execution: {e}")
+        raise
     finally:
         if is_temporary:
+            logger.info("Stopping temporary session")
             await executor.stop()
+            logger.info("Temporary session stopped")
 
 @mcp.tool()
 def list_files() -> str:
@@ -174,9 +226,42 @@ def serve(
     os.environ["OUTPUT_DIR"] = output_dir or "~/output"
     os.environ["SESSION_TIMEOUT"] = str(session_timeout or 600)
     
-    mcp.settings.port = port or 5010
-    _transport = cast(Literal["stdio", "sse", "streamable-http"], transport or "streamable-http")
-    mcp.run(transport=_transport)
+    os.environ["DATA_DIR"] = data_dir or "~/data"
+    os.environ["OUTPUT_DIR"] = output_dir or "~/output"
+    os.environ["SESSION_TIMEOUT"] = str(session_timeout or 600)
+    
+    port = port or 5010
+    
+    # We enforce streamable-http and run uvicorn manually to control shutdown timeout
+    # mcp.run(transport="streamable-http") 
+    
+    import uvicorn
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import Response
+
+    # Middleware to suppress CancelledError during shutdown to avoid noisy tracebacks
+    async def suppress_cancellation_middleware(scope, receive, send):
+        try:
+            # streamable_http_app is a method that returns the ASGI app
+            app = mcp.streamable_http_app
+            if callable(app) and not inspect.iscoroutinefunction(app) and not isinstance(app, type):
+                 # It's a method returning the app
+                 app = app()
+            
+            await app(scope, receive, send)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            raise
+
+    logger.info(f"Starting server on port {port} with graceful shutdown timeout of 2s")
+    
+    uvicorn.run(
+        suppress_cancellation_middleware,
+        host="0.0.0.0", 
+        port=port, 
+        timeout_graceful_shutdown=2.0
+    )
 
 
 if __name__ == "__main__":
